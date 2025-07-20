@@ -1,193 +1,395 @@
-# This workflow will install Python dependencies, run tests and lint with a single version of Python
-# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
-
 name: Build
-
 on:
   push:
     branches:
       - main
 
-  pull_request:
-    branches:
-      - main
-
-  schedule:
-    - cron: "15 21 * * FRI"
-
-  workflow_call:
-    secrets:
-      codecov_token:
-        required: true
-
-permissions: read-all
-
 jobs:
   build:
-
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-24.04, macos-14, windows-2022]
-        python-version: ['3.9', '3.10', '3.11']
     env:
-      TVM_VERSION_TAG: v0.17.0
-      PYTORCH_VERSION: 2.4.1
       LLVM_VERSION: 18
-
-    steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Lint with flake8
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install flake8
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # The GitHub editor is 127 chars wide
-        flake8 . --count  --max-complexity=10 --max-line-length=127 --statistics
-    # PyTorch CPU for Linux has different pip syntax wrt Win and Mac.
-    - name: Install torch-${{ env.PYTORCH_VERSION }}+cpu if linux
-      if: ${{ startsWith(matrix.os, 'ubuntu') }}
-      run: python -m pip install torch==${{ env.PYTORCH_VERSION }} --extra-index-url https://download.pytorch.org/whl/cpu
-    - name: Install torch-${{ env.PYTORCH_VERSION }}+cpu if not linux
-      if:  ${{ !startsWith(matrix.os, 'ubuntu') }}
-      run: python -m pip install torch==${{ env.PYTORCH_VERSION }}
-    - name: Install basic dependencies
-      run: |
-        python -m pip install -e .[tests] -f https://download.pytorch.org/whl/torch_stable.html
-    - name: Test with older SKLearn on Linux with py3.9 to check backward compatibility
-      if: ${{ matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu') == true }}
-      run: python -m pip install scikit-learn==1.2.1 numpy==1.26.4
-    - name: Pin SKLearn<1.5.0 on not Linux with py3.9
-      if: ${{ !(matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu') == true) }}
-      run: python -m pip install "scikit-learn<1.5.0" numpy==1.26.4
-    - name: Run basic tests without extra
-      run: pytest
-    - name: Coverage on basic tests without extra
-      run: coverage run -a -m pytest tests/test_no_extra_install.py
-    - name: If mac, install libomp to facilitate lgbm install
-      if: ${{ startsWith(matrix.os, 'macos')}}
-      run: |
-        wget https://raw.githubusercontent.com/Homebrew/homebrew-core/fb8323f2b170bd4ae97e1bac9bf3e2983af3fdb0/Formula/libomp.rb
-        brew install ./libomp.rb
-        export CC=/usr/bin/clang
-        export CXX=/usr/bin/clang++
-        export CPPFLAGS="$CPPFLAGS -Xpreprocessor -fopenmp"
-        export CFLAGS="$CFLAGS -I/usr/local/opt/libomp/include"
-        export CXXFLAGS="$CXXFLAGS -I/usr/local/opt/libomp/include"
-        export LDFLAGS="$LDFLAGS -Wl,-rpath,/usr/local/opt/libomp/lib -L/usr/local/opt/libomp/lib -lomp"
-    - name: Install extra dependencies
-      run: |
-        python -m pip install .[extra,onnx,sparkml]
-        python -m pip install pandas
-    - uses: actions/cache@v3
-      # TVM takes forever, we try to cache it.
-      if: ${{ startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')}}
-      id: cache
-      env:
-        CACHE_NUMBER: 14
-      with:
-        path: ~/work/hummingbird/tvm
-        key: ${{ matrix.os }}-python${{ matrix.python-version }}-tvm-${{ env.TVM_VERSION_TAG }}-${{ env.CACHE_NUMBER }}
-    # Getting TVM requires: 1) Install LLVM 2) fetching TVM from github, 3) cmake, 4) make, 5) install python dependency.
-    # 2 to 4 will be retrieved from the cache.
-    # The pipeline only works for Unix systems. For windows we will have to compile LLVM from source which is a no go.
-    - name: Install LLVM if Ubuntu
-      if: ${{ startsWith(matrix.os, 'ubuntu')}}
-      run: |
-        sudo apt install llvm-${{ env.LLVM_VERSION }}-dev libpolly-${{ env.LLVM_VERSION }}-dev
-    - name: Install LLVM if Mac
-      if: ${{ startsWith(matrix.os, 'macos')}}
-      run: |
-        brew install llvm@${{ env.LLVM_VERSION }}
-    - name: Fetch and prepare TVM for compilation if Ubuntu or Mac
-      if: ${{ steps.cache.outputs.cache-hit != 'true' && (startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')) }}
-      run: |
-        cd ~/work/hummingbird
-        git clone https://github.com/apache/tvm.git
-        cd tvm
-        git checkout tags/${{env.TVM_VERSION_TAG}}
-        git submodule update --recursive --init
-        cmake -E make_directory build
-    - name: CMake TVM if Ubuntu
-      if: ${{ steps.cache.outputs.cache-hit != 'true' && startsWith(matrix.os, 'ubuntu') }}
-      run: |
-        cd ~/work/hummingbird/tvm
-        cmake -S . -B build \
-          -DUSE_RPC=ON \
-          -DUSE_GRAPH_RUNTIME=ON \
-          -DUSE_LLVM="llvm-config-${{ env.LLVM_VERSION }} --link-static" \
-          -DHIDE_PRIVATE_SYMBOLS=ON
-    - name: CMake TVM if Mac
-      if: ${{ steps.cache.outputs.cache-hit != 'true' && startsWith(matrix.os, 'macos') }}
-      run: |
-        cd ~/work/hummingbird/tvm
-        cmake -S . -B build \
-          -DUSE_RPC=ON \
-          -DUSE_GRAPH_RUNTIME=ON \
-          -DUSE_LLVM="$(brew --prefix llvm@${{ env.LLVM_VERSION }})/bin/llvm-config --link-static" \
-          -DHIDE_PRIVATE_SYMBOLS=ON
-    - name: Build TVM if Ubuntu or Mac
-      if: ${{ steps.cache.outputs.cache-hit != 'true' && (startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')) }}
-      run: |
-        cd ~/work/hummingbird/tvm
-        cmake --build build
-    - name: Install python TVM if Ubuntu or Mac
-      if: ${{  (startsWith(matrix.os, 'macos') || startsWith(matrix.os, 'ubuntu')) }}
-      run: |
-        cd ~/work/hummingbird/tvm/python
-        python3 -m pip install -e .
-
-    # We don't run pytest for ubuntu py3.9 since we do coverage for that case.
-    - name: Test with pytest
-      if: ${{ matrix.python-version != '3.9' || startsWith(matrix.os, 'ubuntu') != true }}
-      run: pytest
-    # Run and push coverage only for ubuntu py3.9
-    - name: Coverage 3.9 ubuntu
-      if: ${{ matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu') }}
-      run: |
-        coverage run -a -m pytest tests
-        coverage xml
-    - name: Upload coverage to Codecov
-      if: ${{ matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu') }}
-      uses: codecov/codecov-action@v4
-      with:
-        file: ./coverage.xml
-        flags: unittests
-        token: ${{ secrets.CODECOV_TOKEN }}
-
-  page-build:
-    needs: build
+      PYTORCH_VERSION: 2.4.1
+      TVM_VERSION_TAG: v0.17.0
     runs-on: ${{ matrix.os }}
+    steps:
+      - name: Start Energy Measurement
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          task: start-measurement
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Lint with flake8
+        run: 'python -m pip install --upgrade pip
+
+          python -m pip install flake8
+
+          # stop the build if there are Python syntax errors or undefined names
+
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+          # The GitHub editor is 127 chars wide
+
+          flake8 . --count  --max-complexity=10 --max-line-length=127 --statistics
+
+          '
+      - id: measurement-4
+        name: Record Measurement After Lint with flake8
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Lint with flake8
+          task: get-measurement
+      - if: ${{ startsWith(matrix.os, 'ubuntu') }}
+        name: Install torch-${{ env.PYTORCH_VERSION }}+cpu if linux
+        run: python -m pip install torch==${{ env.PYTORCH_VERSION }} --extra-index-url
+          https://download.pytorch.org/whl/cpu
+      - id: measurement-6
+        name: Record Measurement After Install torch-${{ env.PYTORCH_VERSION }}+cpu
+          if linux
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Install torch-${{ env.PYTORCH_VERSION }}+cpu if linux
+          task: get-measurement
+      - if: ${{ !startsWith(matrix.os, 'ubuntu') }}
+        name: Install torch-${{ env.PYTORCH_VERSION }}+cpu if not linux
+        run: python -m pip install torch==${{ env.PYTORCH_VERSION }}
+      - id: measurement-8
+        name: Record Measurement After Install torch-${{ env.PYTORCH_VERSION }}+cpu
+          if not linux
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Install torch-${{ env.PYTORCH_VERSION }}+cpu if not linux
+          task: get-measurement
+      - name: Install basic dependencies
+        run: 'python -m pip install -e .[tests] -f https://download.pytorch.org/whl/torch_stable.html
+
+          '
+      - id: measurement-10
+        name: Record Measurement After Install basic dependencies
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Install basic dependencies
+          task: get-measurement
+      - if: ${{ matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu')
+          == true }}
+        name: Test with older SKLearn on Linux with py3.9 to check backward compatibility
+        run: python -m pip install scikit-learn==1.2.1 numpy==1.26.4
+      - id: measurement-12
+        name: Record Measurement After Test with older SKLearn on Linux with py3.9
+          to check backward compatibility
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Test with older SKLearn on Linux with py3.9 to check backward compatibility
+          task: get-measurement
+      - if: ${{ !(matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu')
+          == true) }}
+        name: Pin SKLearn<1.5.0 on not Linux with py3.9
+        run: python -m pip install "scikit-learn<1.5.0" numpy==1.26.4
+      - id: measurement-14
+        name: Record Measurement After Pin SKLearn<1.5.0 on not Linux with py3.9
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Pin SKLearn<1.5.0 on not Linux with py3.9
+          task: get-measurement
+      - name: Run basic tests without extra
+        run: pytest
+      - id: measurement-16
+        name: Record Measurement After Run basic tests without extra
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Run basic tests without extra
+          task: get-measurement
+      - name: Coverage on basic tests without extra
+        run: coverage run -a -m pytest tests/test_no_extra_install.py
+      - id: measurement-18
+        name: Record Measurement After Coverage on basic tests without extra
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Coverage on basic tests without extra
+          task: get-measurement
+      - if: ${{ startsWith(matrix.os, 'macos')}}
+        name: If mac, install libomp to facilitate lgbm install
+        run: 'wget https://raw.githubusercontent.com/Homebrew/homebrew-core/fb8323f2b170bd4ae97e1bac9bf3e2983af3fdb0/Formula/libomp.rb
+
+          brew install ./libomp.rb
+
+          export CC=/usr/bin/clang
+
+          export CXX=/usr/bin/clang++
+
+          export CPPFLAGS="$CPPFLAGS -Xpreprocessor -fopenmp"
+
+          export CFLAGS="$CFLAGS -I/usr/local/opt/libomp/include"
+
+          export CXXFLAGS="$CXXFLAGS -I/usr/local/opt/libomp/include"
+
+          export LDFLAGS="$LDFLAGS -Wl,-rpath,/usr/local/opt/libomp/lib -L/usr/local/opt/libomp/lib
+          -lomp"
+
+          '
+      - id: measurement-20
+        name: Record Measurement After If mac, install libomp to facilitate lgbm install
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: If mac, install libomp to facilitate lgbm install
+          task: get-measurement
+      - name: Install extra dependencies
+        run: 'python -m pip install .[extra,onnx,sparkml]
+
+          python -m pip install pandas
+
+          '
+      - id: measurement-22
+        name: Record Measurement After Install extra dependencies
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Install extra dependencies
+          task: get-measurement
+      - env:
+          CACHE_NUMBER: 14
+        id: cache
+        if: ${{ startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')}}
+        uses: actions/cache@v3
+        with:
+          key: ${{ matrix.os }}-python${{ matrix.python-version }}-tvm-${{ env.TVM_VERSION_TAG
+            }}-${{ env.CACHE_NUMBER }}
+          path: ~/work/hummingbird/tvm
+      - if: ${{ startsWith(matrix.os, 'ubuntu')}}
+        name: Install LLVM if Ubuntu
+        run: 'sudo apt install llvm-${{ env.LLVM_VERSION }}-dev libpolly-${{ env.LLVM_VERSION
+          }}-dev
+
+          '
+      - id: measurement-25
+        name: Record Measurement After Install LLVM if Ubuntu
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Install LLVM if Ubuntu
+          task: get-measurement
+      - if: ${{ startsWith(matrix.os, 'macos')}}
+        name: Install LLVM if Mac
+        run: 'brew install llvm@${{ env.LLVM_VERSION }}
+
+          '
+      - id: measurement-27
+        name: Record Measurement After Install LLVM if Mac
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Install LLVM if Mac
+          task: get-measurement
+      - if: ${{ steps.cache.outputs.cache-hit != 'true' && (startsWith(matrix.os,
+          'ubuntu') || startsWith(matrix.os, 'macos')) }}
+        name: Fetch and prepare TVM for compilation if Ubuntu or Mac
+        run: 'cd ~/work/hummingbird
+
+          git clone https://github.com/apache/tvm.git
+
+          cd tvm
+
+          git checkout tags/${{env.TVM_VERSION_TAG}}
+
+          git submodule update --recursive --init
+
+          cmake -E make_directory build
+
+          '
+      - id: measurement-29
+        name: Record Measurement After Fetch and prepare TVM for compilation if Ubuntu
+          or Mac
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Fetch and prepare TVM for compilation if Ubuntu or Mac
+          task: get-measurement
+      - if: ${{ steps.cache.outputs.cache-hit != 'true' && startsWith(matrix.os, 'ubuntu')
+          }}
+        name: CMake TVM if Ubuntu
+        run: "cd ~/work/hummingbird/tvm\ncmake -S . -B build \\\n  -DUSE_RPC=ON \\\
+          \n  -DUSE_GRAPH_RUNTIME=ON \\\n  -DUSE_LLVM=\"llvm-config-${{ env.LLVM_VERSION\
+          \ }} --link-static\" \\\n  -DHIDE_PRIVATE_SYMBOLS=ON\n"
+      - id: measurement-31
+        name: Record Measurement After CMake TVM if Ubuntu
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: CMake TVM if Ubuntu
+          task: get-measurement
+      - if: ${{ steps.cache.outputs.cache-hit != 'true' && startsWith(matrix.os, 'macos')
+          }}
+        name: CMake TVM if Mac
+        run: "cd ~/work/hummingbird/tvm\ncmake -S . -B build \\\n  -DUSE_RPC=ON \\\
+          \n  -DUSE_GRAPH_RUNTIME=ON \\\n  -DUSE_LLVM=\"$(brew --prefix llvm@${{ env.LLVM_VERSION\
+          \ }})/bin/llvm-config --link-static\" \\\n  -DHIDE_PRIVATE_SYMBOLS=ON\n"
+      - id: measurement-33
+        name: Record Measurement After CMake TVM if Mac
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: CMake TVM if Mac
+          task: get-measurement
+      - if: ${{ steps.cache.outputs.cache-hit != 'true' && (startsWith(matrix.os,
+          'ubuntu') || startsWith(matrix.os, 'macos')) }}
+        name: Build TVM if Ubuntu or Mac
+        run: 'cd ~/work/hummingbird/tvm
+
+          cmake --build build
+
+          '
+      - id: measurement-35
+        name: Record Measurement After Build TVM if Ubuntu or Mac
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Build TVM if Ubuntu or Mac
+          task: get-measurement
+      - if: ${{  (startsWith(matrix.os, 'macos') || startsWith(matrix.os, 'ubuntu'))
+          }}
+        name: Install python TVM if Ubuntu or Mac
+        run: 'cd ~/work/hummingbird/tvm/python
+
+          python3 -m pip install -e .
+
+          '
+      - id: measurement-37
+        name: Record Measurement After Install python TVM if Ubuntu or Mac
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Install python TVM if Ubuntu or Mac
+          task: get-measurement
+      - if: ${{ matrix.python-version != '3.9' || startsWith(matrix.os, 'ubuntu')
+          != true }}
+        name: Test with pytest
+        run: pytest
+      - id: measurement-39
+        name: Record Measurement After Test with pytest
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Test with pytest
+          task: get-measurement
+      - if: ${{ matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu')
+          }}
+        name: Coverage 3.9 ubuntu
+        run: 'coverage run -a -m pytest tests
+
+          coverage xml
+
+          '
+      - id: measurement-41
+        name: Record Measurement After Coverage 3.9 ubuntu
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Coverage 3.9 ubuntu
+          task: get-measurement
+      - if: ${{ matrix.python-version == '3.9' && startsWith(matrix.os, 'ubuntu')
+          }}
+        name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - id: display-measurement
+        name: Display Energy Results
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          task: display-results
+      - name: Save Total Energy Consumption Data
+        run: echo '${{ steps.final-measurement.outputs.data-total-json }}' > total_energy_consumption.json
+      - name: Upload Energy Consumption Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: total-energy-consumption
+          path: total_energy_consumption.json
     strategy:
       matrix:
-        os: [ubuntu-22.04]
-        python-version: ['3.9']
-    permissions: # here we push documentation
+        os:
+          - ubuntu-24.04
+          - macos-14
+          - windows-2022
+        python-version:
+          - '3.9'
+          - '3.10'
+          - '3.11'
+  page-build:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    permissions:
       actions: read
       contents: write
-    if: github.ref == 'refs/heads/main' # only run this on main after PR merged
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Generate Documentation
-      run: |
-        # We're mocking out the torch. So now we also need to sub this on out
-        find ../. -type f -exec sed -i 's/{torch.__version__}/1.12.0/g' {} +
-        find ../. -type f -exec sed -i 's/torch.__version__/"1.12.0"/g' {} +
-        make sphinx-site -C website/
-        # now refresh the code
-        git checkout . && python -m pip install -e .[tests] -f https://download.pytorch.org/whl/torch_stable.html
-    - name: Deploy to GitHub pages 🚀
-      uses: JamesIves/github-pages-deploy-action@v4.4.1
-      with:
-        branch: gh-pages
-        folder: website/public
+      - name: Start Energy Measurement
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          task: start-measurement
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Generate Documentation
+        run: '# We''re mocking out the torch. So now we also need to sub this on out
 
+          find ../. -type f -exec sed -i ''s/{torch.__version__}/1.12.0/g'' {} +
+
+          find ../. -type f -exec sed -i ''s/torch.__version__/"1.12.0"/g'' {} +
+
+          make sphinx-site -C website/
+
+          # now refresh the code
+
+          git checkout . && python -m pip install -e .[tests] -f https://download.pytorch.org/whl/torch_stable.html
+
+          '
+      - id: measurement-4
+        name: Record Measurement After Generate Documentation
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          label: Generate Documentation
+          task: get-measurement
+      - name: "Deploy to GitHub pages \U0001F680"
+        uses: JamesIves/github-pages-deploy-action@v4.4.1
+        with:
+          branch: gh-pages
+          folder: website/public
+      - id: display-measurement
+        name: Display Energy Results
+        uses: green-coding-solutions/eco-ci-energy-estimation@v4
+        with:
+          json-output: true
+          task: display-results
+      - name: Save Total Energy Consumption Data
+        run: echo '${{ steps.final-measurement.outputs.data-total-json }}' > total_energy_consumption.json
+      - name: Upload Energy Consumption Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: total-energy-consumption
+          path: total_energy_consumption.json
+    strategy:
+      matrix:
+        os:
+          - ubuntu-22.04
+        python-version:
+          - '3.9'
+permissions: read-all
