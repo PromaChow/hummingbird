@@ -10,7 +10,7 @@ jobs:
       LLVM_VERSION: 18
       PYTORCH_VERSION: 2.4.1
       TVM_VERSION_TAG: v0.17.0
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Start Energy Measurement
         uses: green-coding-solutions/eco-ci-energy-estimation@862050e4f01f65b1436e5eca18ba4bd85562f0de
